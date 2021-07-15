@@ -1,14 +1,18 @@
 name: $(BuildDefinitionName)-$(date:yyMM).$(date:dd)$(rev:rrr)
-trigger:
-  # Batch merge builds together while a merge build is running
-  batch: true
+trigger: none
+pr: none
+
+schedules:
+# Use https://crontab.guru/#0_8_*_*_* to compute crontab expression
+# Run signed build, with limited signing cert, every day at 9 am
+- cron: 0 9 * * *
   branches:
     include:
-    - master
-pr:
-  branches:
-    include:
-    - master
+    - refs/heads/master
+  always: true
+
+variables:
+  - group: ESRP
 
 resources:
   repositories:
@@ -24,35 +28,11 @@ stages:
   - job: BuildPkg
     displayName: Build Package
     pool:
-      vmImage: windows-latest
+      name: 1ES
+      demands:
+      - ImageOverride -equals MMS2019
 
     steps:
-    - powershell: |
-        $powerShellPath = Join-Path -Path $env:AGENT_TEMPDIRECTORY -ChildPath 'powershell'
-        Invoke-WebRequest -Uri https://raw.githubusercontent.com/PowerShell/PowerShell/master/tools/install-powershell.ps1 -outfile ./install-powershell.ps1
-        ./install-powershell.ps1 -Destination $powerShellPath
-        $vstsCommandString = "vso[task.setvariable variable=PATH]$powerShellPath;$env:PATH"
-        Write-Host "sending " + $vstsCommandString
-        Write-Host "##$vstsCommandString"
-      displayName: Install PowerShell Core
-
-    - task: UseDotNet@2
-      displayName: 'Install .NET Core 3.1.401 SDK'
-      inputs:
-        packageType: sdk
-        version: 3.1.401
-        includePreviewVersions: false
-
-    - task: NuGetToolInstaller@1
-      displayName: 'Install NuGet 5.6.0'
-      inputs:
-        checkLatest: false
-        version: 5.6.0
-
-    - pwsh: |
-        Get-ChildItem -Path env:
-      displayName: Capture environment for build
-      condition: succeededOrFailed()
 
     - pwsh: |
         $modulePath = Join-Path -Path $env:AGENT_TEMPDIRECTORY -ChildPath 'TempModules'
@@ -81,6 +61,12 @@ stages:
       displayName: Install PSPackageProject and dependencies
 
     - pwsh: |
+        Get-ChildItem -Path env:
+        Get-ChildItem -Path . -Recurse -Directory
+      displayName: Capture environment for build
+      condition: succeededOrFailed()
+
+    - pwsh: |
         $modulePath = Join-Path -Path $env:AGENT_TEMPDIRECTORY -ChildPath 'TempModules'
         $env:PSModulePath = $modulePath + [System.IO.Path]::PathSeparator + $env:PSModulePath
         $modPath = Join-Path -Path $modulePath -ChildPath PSPackageProject
@@ -97,8 +83,41 @@ stages:
         Write-Verbose -Verbose "Importing PSPackageProject from: $modPath"
         Import-Module -Name $modPath -Force
         #
-        $(Build.SourcesDirectory)/build.ps1 -Publish
-      displayName: Create module artifact
+        $config = Get-PSPackageProjectConfiguration
+        $signSrcPath = "$($config.BuildOutputPath)\$($config.ModuleName)"
+        $signOutPath = "$($config.SignedOutputPath)\$($config.ModuleName)"
+        if (! (Test-Path -Path $signOutPath)) {
+          $null = New-Item -Path $signOutPath -ItemType Directory
+        }
+        
+        # Set signing src path variable
+        $vstsCommandString = "vso[task.setvariable variable=signSrcPath]${signSrcPath}"
+        Write-Host "sending " + $vstsCommandString
+        Write-Host "##$vstsCommandString"
+
+        # Set signing out path variable
+        $vstsCommandString = "vso[task.setvariable variable=signOutPath]${signOutPath}"
+        Write-Host "sending " + $vstsCommandString
+        Write-Host "##$vstsCommandString"
+      displayName: Set signing path variables for possible module code signing
+
+    - pwsh: |
+        Get-ChildItem -Path env:
+        Get-ChildItem -Path . -Recurse -Directory
+      displayName: Capture environment for build
+      condition: succeededOrFailed()
+
+    - template: EsrpSign.yml@ComplianceRepo
+      parameters:
+        buildOutputPath: $(signSrcPath)
+        signOutputPath: $(signOutPath)
+        certificateId: "CP-460906"
+        shouldSign: $(ShouldSign)
+        pattern: |
+          *.dll
+          *.psd1
+          *.ps1xml
+        useMinimatch: true
 
     - pwsh: |
         $modulePath = Join-Path -Path $env:AGENT_TEMPDIRECTORY -ChildPath 'TempModules'
@@ -106,18 +125,25 @@ stages:
         $modPath = Join-Path -Path $modulePath -ChildPath PSPackageProject
         Write-Verbose -Verbose "Importing PSPackageProject from: $modPath"
         Import-Module -Name $modPath -Force
-        $config = Get-PSPackageProjectConfiguration
         #
-        $srcModulePath = Resolve-Path -Path "$($config.BuildOutputPath)/$($config.ModuleName)"
+        $(Build.SourcesDirectory)/build.ps1 -Publish -Signed
+      displayName: Create module artifact
+      condition: succeeded()
+
+    - pwsh: |
+        $modulePath = Join-Path -Path $env:AGENT_TEMPDIRECTORY -ChildPath 'TempModules'
+        $env:PSModulePath = $modulePath + [System.IO.Path]::PathSeparator + $env:PSModulePath
+        $modPath = Join-Path -Path $modulePath -ChildPath PSPackageProject
+        Write-Verbose -Verbose "Importing PSPackageProject from: $modPath"
+        Import-Module -Name $modPath -Force
+        #
+        $config = Get-PSPackageProjectConfiguration
+        $srcModulePath = Resolve-Path -Path "$($config.SignedOutputPath)/$($config.ModuleName)"
         Get-ChildItem $srcModulePath
         $artifactName = "$($config.ModuleName)"
         Write-Host "##vso[artifact.upload containerfolder=$artifactName;artifactname=$artifactName;]$srcModulePath"
-    #    #
-    #    $refAssemblyNuGetPath = Resolve-Path -Path "$($config.BuildOutputPath)/Microsoft.PowerShell.SecretManagement.Library*.nupkg"
-    #    Get-ChildItem $refAssemblyNuGetPath
-    #    $artifactName = "RefAssemblyNuGet"
-    #    Write-Host "##vso[artifact.upload containerfolder=$artifactName;artifactname=$artifactName;]$refAssemblyNuGetPath"
-      displayName: Upload module artifact for compliance, ref assembly build currently disabled
+      displayName: Create and upload the module artifacts
+      condition: succeeded()
 
 - stage: Compliance
   displayName: Compliance
@@ -125,7 +151,9 @@ stages:
   jobs:
   - job: ComplianceJob
     pool:
-      vmImage: windows-latest
+      name: 1ES
+      demands:
+      - ImageOverride -equals MMS2019
     steps:
     - checkout: self
       clean: true
@@ -133,10 +161,22 @@ stages:
       clean: true
     - download: current
       artifact: 'Microsoft.PowerShell.SecretManagement'
-    - template: ci-compliance.yml@ComplianceRepo
+    - template: assembly-module-compliance.yml@ComplianceRepo
       parameters:
+        # binskim
+        AnalyzeTarget: '$(Pipeline.Workspace)/Microsoft.PowerShell.SecretManagement/*.dll'
+        AnalyzeSymPath: 'SRV*'
+        # component-governance
+        sourceScanPath: '$(Build.SourcesDirectory)'
         # credscan
         suppressionsFile: ''
+        # TermCheck
+        optionsRulesDBPath: ''
+        optionsFTPath: ''
+        # tsa-upload
+        codeBaseName: 'PSSecretsManagement_202001'
+        # selections
+        APIScan: false # set to false when not using Windows APIs
 
 - stage: Test
   displayName: Test Package
@@ -158,7 +198,7 @@ stages:
   - template: test.yml
     parameters:
       jobName: TestPkgUbuntu16
-      displayName: PowerShell Core on Ubuntu 16.04
+      displayName: PowerShell Core on Ubuntu
       imageName: ubuntu-latest
 
   - template: test.yml
